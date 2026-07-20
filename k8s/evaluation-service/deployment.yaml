@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evaluation-service
+  namespace: togglemaster
+  labels:
+    app: evaluation-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: evaluation-service
+  template:
+    metadata:
+      labels:
+        app: evaluation-service
+    spec:
+      containers:
+        - name: evaluation-service
+          image: placeholder-image
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8004
+          env:
+            - name: PORT
+              value: "8004"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: REDIS_HOST
+            - name: REDIS_URL
+              value: "redis://$(REDIS_HOST):6379"
+            - name: FLAG_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: FLAG_SERVICE_URL
+            - name: TARGETING_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: TARGETING_SERVICE_URL
+            - name: SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: feature-flags-secrets
+                  key: SERVICE_API_KEY
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: AWS_REGION
+            - name: AWS_SQS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: AWS_SQS_URL
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+

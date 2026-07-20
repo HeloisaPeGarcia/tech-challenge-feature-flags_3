@@ -1,0 +1,181 @@
+name: Build, Test, Scan and Push to ECR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'auth-service/**'
+      - 'flag-service/**'
+      - 'targeting-service/**'
+      - 'evaluation-service/**'
+      - 'analytics-service/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'auth-service/**'
+      - 'flag-service/**'
+      - 'targeting-service/**'
+      - 'evaluation-service/**'
+      - 'analytics-service/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_PREFIX: fiap
+
+jobs:
+  devsecops-pipeline:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: auth-service
+            language: go
+          - service: flag-service
+            language: python
+          - service: targeting-service
+            language: python
+          - service: evaluation-service
+            language: go
+          - service: analytics-service
+            language: python
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── CONFIGURAÇÃO DE AMBIENTE ─────────────────────────────────────────
+      - name: Configurar Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: './${{ matrix.service }}/go.sum'
+
+      - name: Configurar Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: './${{ matrix.service }}/requirements.txt'
+
+      # ─── JOB 1: BUILD & UNIT TEST ────────────────────────────────────────
+      - name: Build & Test (Go)
+        if: matrix.language == 'go'
+        run: |
+          cd ./${{ matrix.service }}
+          go build -v ./...
+          go test -v ./...
+
+      - name: Build & Test (Python)
+        if: matrix.language == 'python'
+        run: |
+          cd ./${{ matrix.service }}
+          pip install -r requirements.txt
+          python -m py_compile *.py
+
+      # ─── JOB 2: LINTER ───────────────────────────────────────────────────
+      - name: Linter Go (go vet)
+        if: matrix.language == 'go'
+        run: |
+          cd ./${{ matrix.service }}
+          go vet ./...
+
+      - name: Linter Python (flake8)
+        if: matrix.language == 'python'
+        run: |
+          pip install flake8
+          # Bloqueia apenas erros de sintaxe fatais (E9, F63, F7, F82)
+          flake8 ./${{ matrix.service }} --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      # ─── JOB 3: SEGURANÇA — SCA + SAST ───────────────────────────────────
+      # SCA: Trivy verifica dependências de pacotes
+      - name: SCA Scan — Trivy (dependências)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './${{ matrix.service }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      # SAST Go: gosec analisa o código-fonte em busca de falhas de segurança
+      - name: SAST Scan Go (gosec)
+        if: matrix.language == 'go'
+        uses: securego/gosec-action@v3.1.8
+        with:
+          args: './${{ matrix.service }}/...'
+
+      # SAST Python: bandit analisa o código-fonte Python
+      - name: SAST Scan Python (bandit)
+        if: matrix.language == 'python'
+        run: |
+          pip install bandit
+          bandit -r ./${{ matrix.service }} -ll -ii
+
+      # ─── JOB 4: DOCKER BUILD, SCAN & PUSH ───────────────────────────────
+      # Não rodar o push em PRs — apenas em commits na main
+      - name: Configurar credenciais AWS
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        if: github.event_name != 'pull_request'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        if: github.event_name != 'pull_request'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO_NAME: ${{ env.ECR_PREFIX }}/${{ matrix.service }}
+        run: |
+          # Tag APENAS com commit hash — nunca latest (boa prática GitOps)
+          docker build -t $ECR_REGISTRY/$REPO_NAME:${{ github.sha }} ./${{ matrix.service }}
+
+      # Trivy scanneia a imagem Docker ANTES de subir para o ECR
+      - name: Trivy Container Image Scan
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_PREFIX }}/${{ matrix.service }}:${{ github.sha }}'
+          format: 'table'
+          severity: 'CRITICAL'
+          exit-code: '1'
+
+      - name: Push Docker Image to ECR
+        if: github.event_name != 'pull_request'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO_NAME: ${{ env.ECR_PREFIX }}/${{ matrix.service }}
+        run: |
+          docker push $ECR_REGISTRY/$REPO_NAME:${{ github.sha }}
+
+      # ─── JOB 5: GITOPS UPDATE ────────────────────────────────────────────
+      # Atualiza a tag no repositório GitOps usando GITOPS_PAT (Personal Access Token)
+      - name: Update image tag in GitOps manifests
+        if: github.event_name != 'pull_request'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          NEW_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
+        run: |
+          # Atualiza o campo image: no deployment.yaml do serviço correspondente
+          sed -i "s|image:.*|image: ${NEW_IMAGE}|g" ./k8s/${{ matrix.service }}/deployment.yaml
+
+      - name: Commit and push GitOps changes
+        if: github.event_name != 'pull_request'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ./k8s/${{ matrix.service }}/deployment.yaml
+          git diff --staged --quiet || git commit -m "chore(gitops): atualiza ${{ matrix.service }} para ${{ github.sha }} [skip ci]"
+          git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${{ github.repository }}.git HEAD:main

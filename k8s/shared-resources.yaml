@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags-config
+  namespace: togglemaster  # ← mesmo namespace dos deployments e do ArgoCD
+data:
+  # URLs dos serviços internos (resolução interna no cluster Kubernetes)
+  AUTH_SERVICE_URL: "http://auth-service:8001"
+  FLAG_SERVICE_URL: "http://flag-service:8002"
+  TARGETING_SERVICE_URL: "http://targeting-service:8003"
+
+  # ─── Banco de Dados RDS ─────────────────────────────────────────────────
+  # ATENÇÃO: Esses valores são substituídos automaticamente pelo workflow
+  # terraform-infra.yml após o terraform apply. Não edite manualmente.
+  AUTH_DB_HOST: "dev-auth-db.local"
+  FLAGS_DB_HOST: "dev-flags-db.local"
+  TARGETING_DB_HOST: "dev-targeting-db.local"
+
+  DB_USER: "dbadmin"
+  DB_NAME_AUTH: "auth_db"
+  DB_NAME_FLAGS: "flags_db"
+  DB_NAME_TARGETING: "targeting_db"
+
+  # ─── Redis ElastiCache ──────────────────────────────────────────────────
+  # Substituído automaticamente pelo workflow após terraform apply.
+  REDIS_HOST: "dev-redis.local"
+
+  # ─── AWS (SQS, DynamoDB) ────────────────────────────────────────────────
+  # SQS_URL é substituído automaticamente pelo workflow após terraform apply.
+  # Os pods usam as permissões da LabRole do Node Group (sem credenciais estáticas).
+  AWS_REGION: "us-east-1"
+  AWS_SQS_URL: "https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/ToggleMasterEvents"
+  AWS_DYNAMODB_TABLE: "ToggleMasterAnalytics"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feature-flags-secrets
+  namespace: togglemaster  # ← mesmo namespace dos deployments e do ArgoCD
+type: Opaque
+stringData:
+  # Senha do RDS — deve bater com a senha definida no terraform/main.tf
+  # (campo 'password' no recurso aws_db_instance)
+  DB_PASSWORD: "SuperSecurePassword123!"
+
+  # MASTER_KEY: chave usada pelo auth-service para assinar tokens JWT.
+  # Troque por um valor seguro antes de ir para produção.
+  MASTER_KEY: "admin-secreto-123"
+
+  # SERVICE_API_KEY: chave interna usada pelo evaluation-service para
+  # autenticar chamadas entre microsserviços.
+  SERVICE_API_KEY: "temp-key"

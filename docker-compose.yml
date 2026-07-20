@@ -1,0 +1,112 @@
+services:
+
+  postgres-auth:
+    image: postgres:16
+    container_name: postgres-auth
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_auth_data:/var/lib/postgresql/data
+
+  postgres-main:
+    image: postgres:16
+    container_name: postgres-main
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: flags_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_main_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    container_name: dynamodb-local
+    ports:
+      - "8000:8000"
+
+  auth-service:
+    build: ./auth-service
+    container_name: auth-service
+    environment:
+      PORT: 8001
+      DATABASE_URL: postgres://admin:admin123@postgres-auth:5432/auth_db?sslmode=disable
+      MASTER_KEY: admin-secreto-123
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres-auth
+
+  flag-service:
+    build: ./flag-service
+    container_name: flag-service
+    environment:
+      PORT: 8002
+      DATABASE_URL: postgres://admin:admin123@postgres-main:5432/flags_db
+      AUTH_SERVICE_URL: http://auth-service:8001
+    ports:
+      - "8002:8002"
+    depends_on:
+      - auth-service
+      - postgres-main
+
+  targeting-service:
+    build: ./targeting-service
+    container_name: targeting-service
+    environment:
+      PORT: 8003
+      DATABASE_URL: postgres://admin:admin123@postgres-main:5432/flags_db
+      AUTH_SERVICE_URL: http://auth-service:8001
+    ports:
+      - "8003:8003"
+    depends_on:
+      - auth-service
+      - postgres-main
+
+  evaluation-service:
+    build: ./evaluation-service
+    container_name: evaluation-service
+    environment:
+      PORT: 8004
+      REDIS_URL: redis://redis:6379
+      FLAG_SERVICE_URL: http://flag-service:8002
+      TARGETING_SERVICE_URL: http://targeting-service:8003
+      SERVICE_API_KEY: temp-key
+      AWS_REGION: us-east-1
+      AWS_SQS_URL: http://localhost:4566
+    ports:
+      - "8004:8004"
+    depends_on:
+      - redis
+      - flag-service
+      - targeting-service
+
+  analytics-service:
+    build: ./analytics-service
+    container_name: analytics-service
+    environment:
+      PORT: 8005
+      AWS_REGION: us-east-1
+      AWS_SQS_URL: http://localhost:4566
+      AWS_DYNAMODB_TABLE: ToggleMasterAnalytics
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "8005:8005"
+    depends_on:
+      - dynamodb-local
+
+volumes:
+  postgres_auth_data:
+  postgres_main_data:

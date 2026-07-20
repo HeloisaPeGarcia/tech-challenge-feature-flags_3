@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-service
+  namespace: togglemaster
+  labels:
+    app: analytics-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: analytics-service
+  template:
+    metadata:
+      labels:
+        app: analytics-service
+    spec:
+      containers:
+        - name: analytics-service
+          image: placeholder-image
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8005
+          env:
+            - name: PORT
+              value: "8005"
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: AWS_REGION
+            - name: AWS_SQS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: AWS_SQS_URL
+            - name: AWS_DYNAMODB_TABLE
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-flags-config
+                  key: AWS_DYNAMODB_TABLE
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+
