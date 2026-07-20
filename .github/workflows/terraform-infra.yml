@@ -283,6 +283,58 @@ jobs:
             -o jsonpath="{.data.password}" | base64 -d
           echo ""
 
+      - name: Aguardar sincronização e saúde dos Microsserviços
+        if: github.event.inputs.action == 'apply'
+        run: |
+          echo "⏳ Aguardando os rollouts dos microsserviços finalizarem..."
+          kubectl rollout status deployment/auth-service -n togglemaster --timeout=180s
+          kubectl rollout status deployment/flag-service -n togglemaster --timeout=180s
+          kubectl rollout status deployment/targeting-service -n togglemaster --timeout=180s
+          kubectl rollout status deployment/evaluation-service -n togglemaster --timeout=180s
+          kubectl rollout status deployment/analytics-service -n togglemaster --timeout=180s
+          echo "✅ Todos os deployments estão ativos e prontos!"
+
+      - name: Rodar Smoke Test interno (Teste de Fumaça)
+        if: github.event.inputs.action == 'apply'
+        run: |
+          echo "🧪 Criando pod temporário para teste de fumaça..."
+          kubectl run smoke-test-pod \
+            --namespace togglemaster \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --command -- \
+            sh -c "
+              set -e
+              echo '--- Testando auth-service ---' && curl -sS -f --connect-timeout 5 http://auth-service:8001/health
+              echo '--- Testando flag-service ---' && curl -sS -f --connect-timeout 5 http://flag-service:8002/health
+              echo '--- Testando targeting-service ---' && curl -sS -f --connect-timeout 5 http://targeting-service:8003/health
+              echo '--- Testando evaluation-service ---' && curl -sS -f --connect-timeout 5 http://evaluation-service:8004/health
+              echo '--- Testando analytics-service ---' && curl -sS -f --connect-timeout 5 http://analytics-service:8005/health
+            "
+          
+          echo "⏳ Aguardando conclusão do pod de teste..."
+          for i in {1..12}; do
+            PHASE=$(kubectl get pod smoke-test-pod -n togglemaster -o jsonpath='{.status.phase}' 2>/dev/null)
+            echo "Aguardando... status atual: $PHASE"
+            if [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              break
+            fi
+            sleep 5
+          done
+          
+          echo "📝 Exibindo logs do teste de fumaça:"
+          kubectl logs smoke-test-pod -n togglemaster
+          
+          PHASE=$(kubectl get pod smoke-test-pod -n togglemaster -o jsonpath='{.status.phase}')
+          echo "Limpando pod de teste..."
+          kubectl delete pod smoke-test-pod -n togglemaster
+          
+          if [ "$PHASE" != "Succeeded" ]; then
+            echo "❌ Smoke test falhou!"
+            exit 1
+          fi
+          echo "✅ Smoke test passou com sucesso!"
+
       - name: Resumo do Deploy
         if: github.event.inputs.action == 'apply'
         run: |
