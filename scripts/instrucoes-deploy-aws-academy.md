@@ -66,19 +66,12 @@ Acesse seu repositório no GitHub → **Settings → Secrets and variables → A
 | `AWS_SECRET_ACCESS_KEY` | Copiado no Passo 1 |
 | `AWS_SESSION_TOKEN` | Copiado no Passo 1 (string longa) |
 | `AWS_ACCOUNT_ID` | No console AWS → canto superior direito (formato `123456789012`) |
-| `GITOPS_PAT` | Veja instruções abaixo ↓ |
 
-#### Como criar o `GITOPS_PAT` (Personal Access Token):
-1. No GitHub, vá em **Perfil → Settings → Developer settings → Personal access tokens → Tokens (classic)**
-2. Clique em **Generate new token (classic)**
-3. Nome: `GITOPS_PAT`
-4. Expiração: `90 days` (ou mais)
-5. Marque as permissões: **`repo`** (acesso total ao repositório)
-6. Clique em **Generate token** e copie o valor
-7. Cadastre como o secret `GITOPS_PAT` no repositório
+> [!NOTE]
+> **Aviso sobre GitOps:** O workflow foi atualizado para utilizar o token nativo do GitHub (`GITHUB_TOKEN`) com permissão de escrita (`contents: write`). Não é necessário criar nem configurar a variável `GITOPS_PAT` nos Secrets!
 
 > [!IMPORTANT]
-> Toda vez que o Lab reiniciar e as credenciais expirarem, você precisará atualizar apenas os 3 secrets `AWS_*` no GitHub (Passo 3). O `GITOPS_PAT` não expira com o Lab.
+> Toda vez que o Lab reiniciar e as credenciais expirarem, você precisará atualizar apenas os 3 secrets `AWS_*` no GitHub (Passo 3).
 
 ---
 
