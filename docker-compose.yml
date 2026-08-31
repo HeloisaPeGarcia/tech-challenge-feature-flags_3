@@ -11,6 +11,12 @@ services:
       - "5432:5432"
     volumes:
       - postgres_auth_data:/var/lib/postgresql/data
+      - ./auth-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d auth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   postgres-main:
     image: postgres:16
@@ -23,12 +29,24 @@ services:
       - "5433:5432"
     volumes:
       - postgres_main_data:/var/lib/postgresql/data
+      - ./flag-service/db/init.sql:/docker-entrypoint-initdb.d/01-flags.sql:ro
+      - ./targeting-service/db/init.sql:/docker-entrypoint-initdb.d/02-targeting.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d flags_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
     container_name: redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   dynamodb-local:
     image: amazon/dynamodb-local
@@ -46,7 +64,8 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      - postgres-auth
+      postgres-auth:
+        condition: service_healthy
 
   flag-service:
     build: ./flag-service
@@ -58,8 +77,10 @@ services:
     ports:
       - "8002:8002"
     depends_on:
-      - auth-service
-      - postgres-main
+      auth-service:
+        condition: service_started
+      postgres-main:
+        condition: service_healthy
 
   targeting-service:
     build: ./targeting-service
@@ -71,8 +92,10 @@ services:
     ports:
       - "8003:8003"
     depends_on:
-      - auth-service
-      - postgres-main
+      auth-service:
+        condition: service_started
+      postgres-main:
+        condition: service_healthy
 
   evaluation-service:
     build: ./evaluation-service
@@ -88,9 +111,12 @@ services:
     ports:
       - "8004:8004"
     depends_on:
-      - redis
-      - flag-service
-      - targeting-service
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_started
+      targeting-service:
+        condition: service_started
 
   analytics-service:
     build: ./analytics-service

@@ -408,10 +408,10 @@ resource "aws_elasticache_cluster" "redis" {
 resource "aws_dynamodb_table" "analytics" {
   name         = "ToggleMasterAnalytics"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "id"
+  hash_key     = "event_id"
 
   attribute {
-    name = "id"
+    name = "event_id"
     type = "S"
   }
 
