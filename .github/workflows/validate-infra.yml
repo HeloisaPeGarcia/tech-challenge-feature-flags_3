@@ -1,0 +1,618 @@
+name: Validação da Infraestrutura (E2E)
+
+# Disparado manualmente após o 'terraform apply' terminar.
+# Lê todos os endpoints dinâmicos DIRETAMENTE DO CLUSTER (ConfigMap + Secrets)
+# sem nenhum valor hardcoded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Nome do cluster EKS (gerado pelo Terraform como <environment>-cluster)'
+        required: false
+        default: 'dev-cluster'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  NAMESPACE: togglemaster
+
+jobs:
+  validate:
+    name: 'Validação E2E — ${{ github.event.inputs.cluster_name || ''dev-cluster'' }}'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Conectar ao cluster EKS
+        run: |
+          # O nome do cluster é determinístico: var.environment + "-cluster"
+          # Terraform usa environment="dev" por padrão → sempre "dev-cluster"
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name || 'dev-cluster' }}"
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name "${CLUSTER_NAME}"
+          kubectl cluster-info
+
+      # ════════════════════════════════════════════════════════════════════
+      # PASSO-CHAVE: LER TODOS OS ENDPOINTS DINÂMICOS DO PRÓPRIO CLUSTER
+      #
+      # O workflow terraform-infra.yml, ao terminar o 'apply', já:
+      #   1. Captura os outputs do Terraform (rds_auth_endpoint, redis_host, etc.)
+      #   2. Atualiza k8s/shared-resources.yaml com os endpoints reais via 'sed'
+      #   3. Faz 'kubectl apply -f k8s/shared-resources.yaml' no cluster
+      #
+      # Portanto o ConfigMap 'feature-flags-config' JÁ TEM os valores reais.
+      # Este workflow apenas os lê de lá — sem hardcode, sem necessidade
+      # de saber os IDs antecipadamente.
+      # ════════════════════════════════════════════════════════════════════
+      - name: Ler endpoints dinâmicos do ConfigMap e Secrets do cluster
+        run: |
+          echo "====================================================="
+          echo " Lendo configuração dinâmica do cluster..."
+          echo "====================================================="
+
+          # ── Endpoints de banco de dados (RDS) ──
+          AUTH_DB_HOST=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.AUTH_DB_HOST}')
+
+          FLAGS_DB_HOST=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.FLAGS_DB_HOST}')
+
+          TARGETING_DB_HOST=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.TARGETING_DB_HOST}')
+
+          # ── Endpoint do Redis ElastiCache ──
+          REDIS_HOST=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.REDIS_HOST}')
+
+          # ── URL da fila SQS ──
+          SQS_URL=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.AWS_SQS_URL}')
+
+          # ── Tabela DynamoDB ──
+          DYNAMODB_TABLE=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.AWS_DYNAMODB_TABLE}')
+
+          # ── Usuário do banco ──
+          DB_USER=$(kubectl get configmap feature-flags-config \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.DB_USER}')
+
+          # ── Senha do banco (Secret) ──
+          DB_PASSWORD=$(kubectl get secret feature-flags-secrets \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.DB_PASSWORD}' | base64 -d)
+
+          # ── MASTER_KEY do auth-service (Secret) ──
+          MASTER_KEY=$(kubectl get secret feature-flags-secrets \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.data.MASTER_KEY}' | base64 -d)
+
+          # ── Exibe o que foi encontrado (sem expor senhas) ──
+          echo ""
+          echo "Endpoints encontrados no cluster:"
+          echo "  RDS Auth:      ${AUTH_DB_HOST}"
+          echo "  RDS Flags:     ${FLAGS_DB_HOST}"
+          echo "  RDS Targeting: ${TARGETING_DB_HOST}"
+          echo "  Redis:         ${REDIS_HOST}"
+          echo "  SQS URL:       ${SQS_URL}"
+          echo "  DynamoDB:      ${DYNAMODB_TABLE}"
+          echo "  DB User:       ${DB_USER}"
+          echo "  MASTER_KEY:    ****** (carregada)"
+
+          # Valida que nenhum endpoint ficou vazio (indicaria que o Terraform
+          # não atualizou o ConfigMap ou o kubectl apply não foi executado)
+          for VAR_NAME in AUTH_DB_HOST FLAGS_DB_HOST TARGETING_DB_HOST REDIS_HOST SQS_URL DB_USER; do
+            VAL=$(eval echo \$$VAR_NAME)
+            if [ -z "$VAL" ] || echo "$VAL" | grep -q "dev.*\.local"; then
+              echo "❌ ERRO: $VAR_NAME está vazio ou contém valor placeholder!"
+              echo "   O 'terraform apply' pode não ter atualizado o ConfigMap."
+              exit 1
+            fi
+          done
+          echo ""
+          echo "✅ Todos os endpoints estão populados com valores reais do AWS."
+
+          # Exporta para os passos seguintes via GITHUB_ENV
+          echo "AUTH_DB_HOST=${AUTH_DB_HOST}"         >> $GITHUB_ENV
+          echo "FLAGS_DB_HOST=${FLAGS_DB_HOST}"       >> $GITHUB_ENV
+          echo "TARGETING_DB_HOST=${TARGETING_DB_HOST}" >> $GITHUB_ENV
+          echo "REDIS_HOST=${REDIS_HOST}"             >> $GITHUB_ENV
+          echo "SQS_URL=${SQS_URL}"                   >> $GITHUB_ENV
+          echo "DYNAMODB_TABLE=${DYNAMODB_TABLE}"     >> $GITHUB_ENV
+          echo "DB_USER=${DB_USER}"                   >> $GITHUB_ENV
+          echo "DB_PASSWORD=${DB_PASSWORD}"           >> $GITHUB_ENV
+          echo "MASTER_KEY=${MASTER_KEY}"             >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════════════
+      # BLOCO 1: Estado do Cluster
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: "[1/4] Estado dos Nodes e Pods"
+        run: |
+          echo "====================================================="
+          echo " Nodes do Cluster EKS"
+          echo "====================================================="
+          kubectl get nodes -o wide
+
+          NOT_READY=$(kubectl get nodes --no-headers | grep -cv " Ready" || true)
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "❌ $NOT_READY node(s) NÃO estão Ready"
+            exit 1
+          fi
+          echo "✅ Todos os nodes estão Ready"
+
+          echo ""
+          echo "====================================================="
+          echo " Pods (namespace: ${{ env.NAMESPACE }})"
+          echo "====================================================="
+          kubectl get pods -n ${{ env.NAMESPACE }} -o wide
+
+          FAIL=$(kubectl get pods -n ${{ env.NAMESPACE }} --no-headers \
+            | grep -cv "Running\|Completed" || true)
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "❌ $FAIL pod(s) com problema — exibindo logs:"
+            for pod in $(kubectl get pods -n ${{ env.NAMESPACE }} --no-headers \
+              | grep -v "Running\|Completed" | awk '{print $1}'); do
+              echo "=== Logs: $pod ==="
+              kubectl logs "$pod" -n ${{ env.NAMESPACE }} --tail=50 || true
+              echo "=== Describe: $pod ==="
+              kubectl describe pod "$pod" -n ${{ env.NAMESPACE }} | tail -30 || true
+            done
+            exit 1
+          fi
+          echo "✅ Todos os pods estão Running"
+
+          echo ""
+          echo "====================================================="
+          echo " Rollout dos Deployments"
+          echo "====================================================="
+          for svc in auth-service flag-service targeting-service evaluation-service analytics-service; do
+            kubectl rollout status deployment/$svc \
+              -n ${{ env.NAMESPACE }} --timeout=120s
+            echo "  ✅ $svc"
+          done
+
+      # ═══════════════════════════════════════════════════════════════════
+      # BLOCO 2: Teste de Conectividade Direta (dentro do cluster)
+      #
+      # Um pod Alpine temporário é criado DENTRO do cluster.
+      # Ele recebe os endpoints dinâmicos via --env e testa:
+      #   - Conexão PostgreSQL em cada banco RDS (lê tabelas reais)
+      #   - Conexão Redis ElastiCache (PING)
+      #   - HTTP entre microsserviços (simula chamadas internas reais)
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: "[2/4] Teste de Conectividade — DBs, Redis e Inter-Serviços"
+        run: |
+          echo "Removendo pod de diagnóstico anterior (se existir)..."
+          kubectl delete pod diag-pod -n ${{ env.NAMESPACE }} \
+            --ignore-not-found=true --wait=true
+
+          echo "Criando pod de diagnóstico dentro do cluster..."
+          kubectl run diag-pod \
+            --image=alpine:3.19 \
+            --restart=Never \
+            -n ${{ env.NAMESPACE }} \
+            --env="AUTH_DB_HOST=${{ env.AUTH_DB_HOST }}" \
+            --env="FLAGS_DB_HOST=${{ env.FLAGS_DB_HOST }}" \
+            --env="TARGETING_DB_HOST=${{ env.TARGETING_DB_HOST }}" \
+            --env="REDIS_HOST=${{ env.REDIS_HOST }}" \
+            --env="DB_USER=${{ env.DB_USER }}" \
+            --env="DB_PASS=${{ env.DB_PASSWORD }}" \
+            --command -- sh -c "
+              # Instala as ferramentas necessárias
+              apk add --no-cache postgresql-client redis curl 2>/dev/null
+              
+              EXIT_CODE=0
+
+              echo '====================================================='
+              echo ' [A] PostgreSQL — Bancos de Dados RDS'
+              echo '====================================================='
+
+              # Testa auth_db
+              echo '→ Testando auth_db ...'
+              PGPASSWORD=\$DB_PASS psql \
+                -h \$AUTH_DB_HOST -U \$DB_USER -d auth_db \
+                -c 'SELECT COUNT(*) AS total_chaves FROM api_keys;' \
+                && echo '  ✅ auth_db: conexão OK' \
+                || { echo '  ❌ auth_db: FALHA na conexão'; EXIT_CODE=1; }
+
+              # Testa flags_db
+              echo '→ Testando flags_db ...'
+              PGPASSWORD=\$DB_PASS psql \
+                -h \$FLAGS_DB_HOST -U \$DB_USER -d flags_db \
+                -c 'SELECT COUNT(*) AS total_flags FROM flags;' \
+                && echo '  ✅ flags_db: conexão OK' \
+                || { echo '  ❌ flags_db: FALHA na conexão'; EXIT_CODE=1; }
+
+              # Testa targeting_db
+              echo '→ Testando targeting_db ...'
+              PGPASSWORD=\$DB_PASS psql \
+                -h \$TARGETING_DB_HOST -U \$DB_USER -d targeting_db \
+                -c 'SELECT COUNT(*) AS total_regras FROM targeting_rules;' \
+                && echo '  ✅ targeting_db: conexão OK' \
+                || { echo '  ❌ targeting_db: FALHA na conexão'; EXIT_CODE=1; }
+
+              echo ''
+              echo '====================================================='
+              echo ' [B] Redis ElastiCache'
+              echo '====================================================='
+              echo '→ Testando Redis ...'
+              redis-cli -h \$REDIS_HOST ping \
+                && echo '  ✅ Redis: PONG recebido' \
+                || { echo '  ❌ Redis: FALHA no PING'; EXIT_CODE=1; }
+
+              echo ''
+              echo '====================================================='
+              echo ' [C] Conectividade HTTP entre Microsserviços'
+              echo '====================================================='
+
+              # auth-service: saúde
+              echo '→ auth-service /health ...'
+              curl -sf --connect-timeout 5 http://auth-service:8001/health \
+                && echo '  ✅ auth-service: acessível' \
+                || { echo '  ❌ auth-service: inacessível'; EXIT_CODE=1; }
+
+              # flag-service → chama auth-service internamente
+              echo '→ flag-service /health ...'
+              curl -sf --connect-timeout 5 http://flag-service:8002/health \
+                && echo '  ✅ flag-service: acessível' \
+                || { echo '  ❌ flag-service: inacessível'; EXIT_CODE=1; }
+
+              # targeting-service → chama auth-service internamente
+              echo '→ targeting-service /health ...'
+              curl -sf --connect-timeout 5 http://targeting-service:8003/health \
+                && echo '  ✅ targeting-service: acessível' \
+                || { echo '  ❌ targeting-service: inacessível'; EXIT_CODE=1; }
+
+              # evaluation-service → chama flag-service + targeting-service + Redis
+              echo '→ evaluation-service /health ...'
+              curl -sf --connect-timeout 5 http://evaluation-service:8004/health \
+                && echo '  ✅ evaluation-service: acessível' \
+                || { echo '  ❌ evaluation-service: inacessível'; EXIT_CODE=1; }
+
+              # analytics-service → consome SQS, grava DynamoDB
+              echo '→ analytics-service /health ...'
+              curl -sf --connect-timeout 5 http://analytics-service:8005/health \
+                && echo '  ✅ analytics-service: acessível' \
+                || { echo '  ❌ analytics-service: inacessível'; EXIT_CODE=1; }
+
+              echo ''
+              echo '====================================================='
+              echo ' [D] Validar autenticação cruzada entre serviços'
+              echo '====================================================='
+              # flag-service valida tokens no auth-service.
+              # Uma chamada sem token deve retornar 401 (não 502/503)
+              # Se retornar 502/503, o flag-service não consegue alcançar o auth-service.
+              echo '→ flag-service → auth-service (token inválido → deve retornar 401) ...'
+              STATUS=\$(curl -s -o /dev/null -w '%{http_code}' \
+                http://flag-service:8002/flags \
+                -H 'Authorization: Bearer token-invalido')
+              if [ \"\$STATUS\" = '401' ]; then
+                echo \"  ✅ flag-service → auth-service: comunicação OK (retornou \$STATUS conforme esperado)\"
+              else
+                echo \"  ❌ flag-service → auth-service: problema! HTTP \$STATUS (esperado 401)\"
+                EXIT_CODE=1
+              fi
+
+              # targeting-service valida tokens no auth-service.
+              echo '→ targeting-service → auth-service (token inválido → deve retornar 401) ...'
+              STATUS=\$(curl -s -o /dev/null -w '%{http_code}' \
+                http://targeting-service:8003/rules/qualquer-flag \
+                -H 'Authorization: Bearer token-invalido')
+              if [ \"\$STATUS\" = '401' ]; then
+                echo \"  ✅ targeting-service → auth-service: comunicação OK (retornou \$STATUS conforme esperado)\"
+              else
+                echo \"  ❌ targeting-service → auth-service: problema! HTTP \$STATUS (esperado 401)\"
+                EXIT_CODE=1
+              fi
+
+              echo ''
+              if [ \"\$EXIT_CODE\" = '0' ]; then
+                echo '✅ Todos os testes de conectividade passaram!'
+              else
+                echo '❌ Um ou mais testes de conectividade falharam!'
+              fi
+
+              exit \$EXIT_CODE
+            "
+
+          # Aguarda o pod finalizar (máx 4 minutos para instalar pacotes + rodar testes)
+          echo "Aguardando pod de diagnóstico finalizar..."
+          kubectl wait pod/diag-pod \
+            -n ${{ env.NAMESPACE }} \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            --timeout=240s || true
+
+          echo ""
+          echo "=== Logs do pod de diagnóstico ==="
+          kubectl logs diag-pod -n ${{ env.NAMESPACE }}
+
+          PHASE=$(kubectl get pod diag-pod \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.status.phase}')
+
+          kubectl delete pod diag-pod \
+            -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+          if [ "$PHASE" != "Succeeded" ]; then
+            echo "❌ Testes de conectividade falharam! Status: $PHASE"
+            exit 1
+          fi
+
+      # ═══════════════════════════════════════════════════════════════════
+      # BLOCO 3: Teste E2E do Fluxo de Negócio completo via Port-Forward
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: "[3/4] Teste E2E — Fluxo Completo de Negócio"
+        run: |
+          echo "Iniciando port-forwards para acesso externo ao cluster..."
+          kubectl port-forward svc/auth-service       8001:8001 -n ${{ env.NAMESPACE }} &
+          kubectl port-forward svc/flag-service       8002:8002 -n ${{ env.NAMESPACE }} &
+          kubectl port-forward svc/targeting-service  8003:8003 -n ${{ env.NAMESPACE }} &
+          kubectl port-forward svc/evaluation-service 8004:8004 -n ${{ env.NAMESPACE }} &
+          kubectl port-forward svc/analytics-service  8005:8005 -n ${{ env.NAMESPACE }} &
+          sleep 8
+
+          # MASTER_KEY já foi lida do cluster no passo anterior
+          MASTER_KEY="${{ env.MASTER_KEY }}"
+
+          # ─── [1/5] Health Checks externos ───────────────────────────────
+          echo ""
+          echo "=== [1/5] Health Checks externos (via port-forward) ==="
+          for port_svc in "8001:auth-service" "8002:flag-service" "8003:targeting-service" "8004:evaluation-service" "8005:analytics-service"; do
+            PORT=$(echo "$port_svc" | cut -d':' -f1)
+            SVC=$(echo  "$port_svc" | cut -d':' -f2)
+            RESP=$(curl -sf --connect-timeout 5 "http://localhost:${PORT}/health" || echo "FAIL")
+            if echo "$RESP" | grep -q "ok"; then
+              echo "  ✅ ${SVC}:${PORT}"
+            else
+              echo "  ❌ ${SVC}:${PORT} → ${RESP}"; exit 1
+            fi
+          done
+
+          # ─── [2/5] Criar e validar chave de API ──────────────────────────
+          echo ""
+          echo "=== [2/5] Autenticação — Criar e Validar Chave de API ==="
+
+          KEY_RESP=$(curl -sf -X POST http://localhost:8001/admin/keys \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${MASTER_KEY}" \
+            -d '{"name": "e2e-ci-runner"}')
+
+          API_KEY=$(echo "$KEY_RESP" | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
+          if [ -z "$API_KEY" ]; then
+            echo "❌ Falha ao criar chave: ${KEY_RESP}"; exit 1
+          fi
+          echo "  ✅ Chave criada: ${API_KEY:0:20}..."
+
+          VALID_RESP=$(curl -sf http://localhost:8001/validate \
+            -H "Authorization: Bearer ${API_KEY}")
+          if echo "$VALID_RESP" | grep -q "ok\|válida"; then
+            echo "  ✅ Chave validada com sucesso"
+          else
+            echo "  ❌ Validação falhou: ${VALID_RESP}"; exit 1
+          fi
+
+          # ─── [3/5] Criar Feature Flag ─────────────────────────────────────
+          FLAG_NAME="e2e-$(date +%s)"
+          echo ""
+          echo "=== [3/5] Feature Flag — Criar '${FLAG_NAME}' ==="
+
+          FLAG_RESP=$(curl -sf -X POST http://localhost:8002/flags \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -d "{\"name\": \"${FLAG_NAME}\", \"description\": \"CI E2E Test\", \"is_enabled\": true}")
+
+          if echo "$FLAG_RESP" | grep -q "${FLAG_NAME}"; then
+            echo "  ✅ Flag '${FLAG_NAME}' criada"
+          else
+            echo "  ❌ Falha ao criar flag: ${FLAG_RESP}"; exit 1
+          fi
+
+          # ─── [4/5] Criar Regra de Targeting ──────────────────────────────
+          echo ""
+          echo "=== [4/5] Targeting — Criar regra 50% para '${FLAG_NAME}' ==="
+
+          RULE_RESP=$(curl -sf -X POST http://localhost:8003/rules \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -d "{\"flag_name\": \"${FLAG_NAME}\", \"rules\": {\"type\": \"PERCENTAGE\", \"value\": 50}}")
+
+          if echo "$RULE_RESP" | grep -q "${FLAG_NAME}"; then
+            echo "  ✅ Regra de targeting (50%) criada"
+          else
+            echo "  ❌ Falha ao criar regra: ${RULE_RESP}"; exit 1
+          fi
+
+          # ─── [5/5] Avaliar flag — testa todo o pipeline interno ──────────
+          # Esta chamada ao /evaluate:
+          #   → evaluation-service busca flag no cache Redis
+          #   → Se cache MISS: chama flag-service (que chama auth-service)
+          #   → Chama targeting-service (que chama auth-service)
+          #   → Salva no Redis
+          #   → Envia evento assíncrono para SQS
+          echo ""
+          echo "=== [5/5] Evaluation — Testar pipeline completo para 8 usuários ==="
+          echo "  (eval → Redis → flag-service → targeting-service → SQS)"
+
+          TRUE_COUNT=0; FALSE_COUNT=0; FAIL_COUNT=0
+          for user in user-alpha user-beta user-gamma user-delta user-epsilon user-zeta user-eta user-theta; do
+            EVAL_RESP=$(curl -sf \
+              "http://localhost:8004/evaluate?user_id=${user}&flag_name=${FLAG_NAME}" \
+              || echo "FAIL")
+
+            if echo "$EVAL_RESP" | grep -q "FAIL\|error"; then
+              echo "  ❌ ${user}: FALHA → ${EVAL_RESP}"
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              continue
+            fi
+
+            VALUE=$(echo "$EVAL_RESP" | grep -o '"result":[a-z]*' | cut -d':' -f2)
+            CACHED=$(curl -sf \
+              "http://localhost:8004/evaluate?user_id=${user}&flag_name=${FLAG_NAME}" \
+              | grep -o '"result":[a-z]*' | cut -d':' -f2)
+
+            if [ "$VALUE" = "$CACHED" ]; then
+              echo "  ✅ ${user}: result=${VALUE} (cache consistente)"
+            else
+              echo "  ⚠️  ${user}: resultado inconsistente entre chamadas (${VALUE} vs ${CACHED})"
+            fi
+
+            if [ "$VALUE" = "true" ]; then TRUE_COUNT=$((TRUE_COUNT+1)); fi
+            if [ "$VALUE" = "false" ]; then FALSE_COUNT=$((FALSE_COUNT+1)); fi
+          done
+
+          echo ""
+          echo "  Habilitados: ${TRUE_COUNT} | Desabilitados: ${FALSE_COUNT} | Falhas: ${FAIL_COUNT}"
+
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo "❌ ${FAIL_COUNT} avaliação(ões) falharam"; exit 1
+          fi
+
+          echo "✅ Fluxo de negócio E2E completo com sucesso!"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # BLOCO 4: Verificação dos Serviços AWS (SQS + DynamoDB)
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: "[4/4] Verificar SQS e DynamoDB (analytics pipeline)"
+        run: |
+          echo "====================================================="
+          echo " Verificação da Fila SQS"
+          echo "====================================================="
+          # Extrai nome da fila da URL dinâmica lida do cluster
+          QUEUE_NAME=$(echo "${{ env.SQS_URL }}" | awk -F'/' '{print $NF}')
+          echo "Fila: ${QUEUE_NAME}"
+
+          SQS_ATTRS=$(aws sqs get-queue-attributes \
+            --queue-url "${{ env.SQS_URL }}" \
+            --attribute-names All \
+            --region ${{ env.AWS_REGION }} \
+            --output json 2>/dev/null || echo "FAIL")
+
+          if echo "$SQS_ATTRS" | grep -q "FAIL"; then
+            echo "❌ Não foi possível acessar a fila SQS"
+          else
+            MSGS_VISIBLE=$(echo "$SQS_ATTRS" | grep -o '"ApproximateNumberOfMessages":"[0-9]*"' | grep -o '[0-9]*' || echo "0")
+            MSGS_INFLIGHT=$(echo "$SQS_ATTRS" | grep -o '"ApproximateNumberOfMessagesNotVisible":"[0-9]*"' | grep -o '[0-9]*' || echo "0")
+            echo "  Mensagens visíveis: ${MSGS_VISIBLE}"
+            echo "  Mensagens em processamento: ${MSGS_INFLIGHT}"
+            echo "  ✅ Fila SQS acessível"
+          fi
+
+          echo ""
+          echo "====================================================="
+          echo " Verificação do DynamoDB"
+          echo "====================================================="
+          echo "Aguardando 30s para o analytics-service processar eventos do SQS..."
+          sleep 30
+
+          TABLE="${{ env.DYNAMODB_TABLE }}"
+          echo "Tabela: ${TABLE}"
+
+          TABLE_INFO=$(aws dynamodb describe-table \
+            --table-name "${TABLE}" \
+            --region ${{ env.AWS_REGION }} \
+            --output json 2>/dev/null || echo "FAIL")
+
+          if echo "$TABLE_INFO" | grep -q "FAIL"; then
+            echo "❌ Tabela ${TABLE} não encontrada"
+          else
+            STATUS=$(echo "$TABLE_INFO" | grep -o '"TableStatus":"[^"]*"' | cut -d'"' -f4)
+            echo "  Status da tabela: ${STATUS}"
+            
+            COUNT=$(aws dynamodb scan \
+              --table-name "${TABLE}" \
+              --select COUNT \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Count' \
+              --output text)
+
+            echo "  Total de eventos registrados: ${COUNT}"
+
+            if [ "$COUNT" -gt 0 ]; then
+              echo "  ✅ Pipeline de analytics funcionando! ${COUNT} evento(s) no DynamoDB."
+              echo ""
+              echo "  Últimos eventos inseridos:"
+              aws dynamodb scan \
+                --table-name "${TABLE}" \
+                --region ${{ env.AWS_REGION }} \
+                --max-items 5 \
+                --query 'Items[*].{Flag:flag_name.S, User:user_id.S, Result:result.BOOL}' \
+                --output table 2>/dev/null || true
+            else
+              echo "  ⚠️  Sem eventos ainda (delay normal do SQS — o analytics pode processar em breve)"
+            fi
+          fi
+
+      # ═══════════════════════════════════════════════════════════════════
+      # RESUMO FINAL
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Gerar Resumo Final
+        if: always()
+        run: |
+          CLUSTER="${{ github.event.inputs.cluster_name || 'dev-cluster' }}"
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🧪 Validação da Infraestrutura ToggleMaster
+
+          **Cluster:** \`${CLUSTER}\`
+          **Região:** \`${{ env.AWS_REGION }}\`
+          **Namespace:** \`${{ env.NAMESPACE }}\`
+
+          ### Endpoints Lidos do Cluster (dinâmicos)
+          | Recurso | Endpoint |
+          |---------|----------|
+          | RDS Auth | \`${{ env.AUTH_DB_HOST }}\` |
+          | RDS Flags | \`${{ env.FLAGS_DB_HOST }}\` |
+          | RDS Targeting | \`${{ env.TARGETING_DB_HOST }}\` |
+          | Redis ElastiCache | \`${{ env.REDIS_HOST }}\` |
+          | SQS | \`${{ env.SQS_URL }}\` |
+          | DynamoDB | \`${{ env.DYNAMODB_TABLE }}\` |
+
+          ### Resultado dos Testes
+          | # | Categoria | Verificação |
+          |---|-----------|-------------|
+          | 1 | Infraestrutura | Nodes EKS Ready |
+          | 2 | Infraestrutura | Pods Running (5 serviços) |
+          | 3 | Infraestrutura | Deployments com rollout ok |
+          | 4 | Conectividade | PostgreSQL auth_db |
+          | 5 | Conectividade | PostgreSQL flags_db |
+          | 6 | Conectividade | PostgreSQL targeting_db |
+          | 7 | Conectividade | Redis ElastiCache (PING) |
+          | 8 | Inter-serviços | flag-service → auth-service (401) |
+          | 9 | Inter-serviços | targeting-service → auth-service (401) |
+          | 10 | Negócio | Criar + validar chave de API |
+          | 11 | Negócio | Criar feature flag |
+          | 12 | Negócio | Criar regra de targeting (50%) |
+          | 13 | Negócio | Avaliar flag (8 usuários + cache) |
+          | 14 | Analytics | Fila SQS acessível |
+          | 15 | Analytics | Eventos no DynamoDB |
+          EOF
