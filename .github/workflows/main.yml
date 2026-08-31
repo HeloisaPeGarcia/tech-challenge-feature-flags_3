@@ -56,7 +56,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache-dependency-path: './${{ matrix.service }}/go.sum'
+          cache: false
 
       - name: Configurar Python
         if: matrix.language == 'python'
